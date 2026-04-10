@@ -2,16 +2,19 @@
 """Sync MyAnimeList ↔ Shikimori anime lists.
 
 First iteration: find anime that are present on one service but missing on
-the other, and (with per-item manual confirmation) create the missing
-entries on the target service. Updates and deletions are out of scope for
+the other and create the missing entries on the target service. By default
+each create is confirmed interactively; pass ``--autosync`` to skip the
+prompts and create everything. Updates and deletions are out of scope for
 this pass.
 
 Run:
-    python3 sync.py
+    python3 sync.py            # interactive per-entry confirmation
+    python3 sync.py --autosync # create everything without prompting
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
 import os
@@ -29,7 +32,9 @@ import shikimori_auth
 
 USER_AGENT = "sync_myanimelist_and_shikimori"
 
-# Seconds to wait between successful write requests, to stay polite.
+# Seconds to wait between successful write requests in --autosync mode.
+# In interactive mode the confirmation prompt already provides pacing, so no
+# extra sleep is needed there.
 _WRITE_DELAY_SEC = 1.0
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -159,15 +164,19 @@ async def _prompt(message: str) -> str:
     return (await asyncio.to_thread(input, message)).strip().lower()
 
 
+def _print_entry(direction: str, entry: ListEntry) -> None:
+    print(f"[{direction}] #{entry.anime_id} {entry.title!r}")
+    print(f"  status:   {entry.status}")
+    print(f"  score:    {entry.score}")
+    print(f"  episodes: {entry.episodes}")
+
+
 async def _confirm_sync(direction: str, entry: ListEntry) -> str:
     """Prompt the user about one planned create. Returns 'y', 'n' or 'q'.
 
     Enter (empty input) defaults to 'y'.
     """
-    print(f"[{direction}] #{entry.anime_id} {entry.title!r}")
-    print(f"  status:   {entry.status}")
-    print(f"  score:    {entry.score}")
-    print(f"  episodes: {entry.episodes}")
+    _print_entry(direction, entry)
     while True:
         answer = await _prompt("  Sync? [Y/n/q] ")
         if answer in ("", "y"):
@@ -190,16 +199,21 @@ async def _push_to_shikimori(
     shiki_user_id: int,
     entries: list[ListEntry],
     tally: dict,
+    *,
+    autosync: bool,
 ) -> bool:
-    """Prompt and create each entry on Shikimori. Returns False if user quit."""
+    """Create each entry on Shikimori. Returns False if user quit."""
     for entry in entries:
-        choice = await _confirm_sync("MAL → Shiki", entry)
-        if choice == "q":
-            return False
-        if choice == "n":
-            tally["skipped"] += 1
-            print("  skipped")
-            continue
+        if autosync:
+            _print_entry("MAL → Shiki", entry)
+        else:
+            choice = await _confirm_sync("MAL → Shiki", entry)
+            if choice == "q":
+                return False
+            if choice == "n":
+                tally["skipped"] += 1
+                print("  skipped")
+                continue
         try:
             await shikimori_api.create_list_entry(
                 shiki_session,
@@ -212,7 +226,8 @@ async def _push_to_shikimori(
             )
             tally["created"] += 1
             print("  ✓ created on Shikimori")
-            await asyncio.sleep(_WRITE_DELAY_SEC)
+            if autosync:
+                await asyncio.sleep(_WRITE_DELAY_SEC)
         except aiohttp.ClientResponseError as e:
             tally["failed"] += 1
             print(f"  ✗ failed: {e.status} {e.message}")
@@ -227,16 +242,21 @@ async def _push_to_mal(
     mal_token: str,
     entries: list[ListEntry],
     tally: dict,
+    *,
+    autosync: bool,
 ) -> bool:
-    """Prompt and create each entry on MAL. Returns False if user quit."""
+    """Create each entry on MAL. Returns False if user quit."""
     for entry in entries:
-        choice = await _confirm_sync("Shiki → MAL", entry)
-        if choice == "q":
-            return False
-        if choice == "n":
-            tally["skipped"] += 1
-            print("  skipped")
-            continue
+        if autosync:
+            _print_entry("Shiki → MAL", entry)
+        else:
+            choice = await _confirm_sync("Shiki → MAL", entry)
+            if choice == "q":
+                return False
+            if choice == "n":
+                tally["skipped"] += 1
+                print("  skipped")
+                continue
         mal_status, is_rewatching = _CANONICAL_TO_MAL[entry.status]
         try:
             await myanimelist_api.create_or_update_list_entry(
@@ -250,7 +270,8 @@ async def _push_to_mal(
             )
             tally["created"] += 1
             print("  ✓ created on MAL")
-            await asyncio.sleep(_WRITE_DELAY_SEC)
+            if autosync:
+                await asyncio.sleep(_WRITE_DELAY_SEC)
         except aiohttp.ClientResponseError as e:
             tally["failed"] += 1
             print(f"  ✗ failed: {e.status} {e.message}")
@@ -266,6 +287,16 @@ async def _push_to_mal(
 
 
 async def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Sync MyAnimeList ↔ Shikimori anime lists."
+    )
+    parser.add_argument(
+        "--autosync",
+        action="store_true",
+        help="Skip per-entry confirmation prompts and create everything.",
+    )
+    args = parser.parse_args()
+
     async with (
         aiohttp.ClientSession(headers={"User-Agent": USER_AGENT}) as mal_session,
         aiohttp.ClientSession(headers={"User-Agent": USER_AGENT}) as shiki_session,
@@ -337,7 +368,12 @@ async def main() -> int:
         if to_push_shiki:
             print("\n--- MAL → Shikimori ---")
             if not await _push_to_shikimori(
-                shiki_session, shiki_token, shiki_id, to_push_shiki, tally
+                shiki_session,
+                shiki_token,
+                shiki_id,
+                to_push_shiki,
+                tally,
+                autosync=args.autosync,
             ):
                 print("Stopped by user.")
                 _print_tally(tally)
@@ -345,7 +381,13 @@ async def main() -> int:
 
         if to_push_mal:
             print("\n--- Shikimori → MAL ---")
-            if not await _push_to_mal(mal_session, mal_token, to_push_mal, tally):
+            if not await _push_to_mal(
+                mal_session,
+                mal_token,
+                to_push_mal,
+                tally,
+                autosync=args.autosync,
+            ):
                 print("Stopped by user.")
                 _print_tally(tally)
                 return 0

@@ -10,7 +10,8 @@ Install deps (only `aiohttp`):
 
 Run the sync (the only user-facing entry point):
 
-    python3 sync.py
+    python3 sync.py              # interactive per-entry [Y/n/q] confirmation
+    python3 sync.py --autosync   # skip prompts, create everything
 
 Each auth/api module is also runnable standalone as a smoke test that prints `whoami`:
 
