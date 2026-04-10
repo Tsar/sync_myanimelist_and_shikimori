@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -47,7 +48,11 @@ def _load_title_cache() -> dict[int, str]:
 
 
 def _save_title_cache(cache: dict[int, str]) -> None:
-    TITLE_CACHE_PATH.write_text(json.dumps(cache, ensure_ascii=False, indent=2))
+    # Atomic save: write to a sibling temp file then rename, so a Ctrl+C
+    # mid-write can't leave a truncated cache behind.
+    tmp = TITLE_CACHE_PATH.with_suffix(TITLE_CACHE_PATH.suffix + ".tmp")
+    tmp.write_text(json.dumps(cache, ensure_ascii=False, indent=2))
+    os.replace(tmp, TITLE_CACHE_PATH)
 
 
 # ---------------------------------------------------------------------------
@@ -155,17 +160,20 @@ async def _prompt(message: str) -> str:
 
 
 async def _confirm_sync(direction: str, entry: ListEntry) -> str:
-    """Prompt the user about one planned create. Returns 'y', 'n' or 'q'."""
-    print(
-        f"[{direction}] #{entry.anime_id} {entry.title!r}  "
-        f"status={entry.status} score={entry.score} episodes={entry.episodes}"
-    )
+    """Prompt the user about one planned create. Returns 'y', 'n' or 'q'.
+
+    Enter (empty input) defaults to 'y'.
+    """
+    print(f"[{direction}] #{entry.anime_id} {entry.title!r}")
+    print(f"  status:   {entry.status}")
+    print(f"  score:    {entry.score}")
+    print(f"  episodes: {entry.episodes}")
     while True:
-        answer = await _prompt("  Sync? [y/N/q] ")
-        if answer in ("", "n"):
-            return "n"
-        if answer == "y":
+        answer = await _prompt("  Sync? [Y/n/q] ")
+        if answer in ("", "y"):
             return "y"
+        if answer == "n":
+            return "n"
         if answer == "q":
             return "q"
         print("  Please answer y, n, or q.")
@@ -303,10 +311,12 @@ async def main() -> int:
             cached_hits = sum(1 for aid in only_in_shiki_ids if aid in title_cache)
             to_fetch = len(only_in_shiki_ids) - cached_hits
             print(f"Resolving titles for {len(only_in_shiki_ids)} Shikimori entries ({cached_hits} cached, {to_fetch} to fetch)...")
-            for idx, anime_id in enumerate(only_in_shiki_ids, start=1):
+            fetch_idx = 0
+            for anime_id in only_in_shiki_ids:
                 title = title_cache.get(anime_id)
                 if title is None:
-                    print(f"  [{idx}/{len(only_in_shiki_ids)}] fetching title for anime #{anime_id}...")
+                    fetch_idx += 1
+                    print(f"  [{fetch_idx}/{to_fetch}] fetching title for anime #{anime_id}...")
                     fetched = await shikimori_api.get_anime_title(shiki_session, anime_id)
                     if fetched is not None:
                         title_cache[anime_id] = fetched

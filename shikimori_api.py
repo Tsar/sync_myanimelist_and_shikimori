@@ -8,6 +8,7 @@ generic User-Agents.
 from __future__ import annotations
 
 import asyncio
+import sys
 
 import aiohttp
 
@@ -15,9 +16,10 @@ import aiohttp
 API_BASE = "https://shikimori.io/api"
 API_V2 = f"{API_BASE}/v2"
 
-# Small delay between sequential public API calls (e.g. title lookups) to
-# stay well under Shikimori's rate limits.
-_POLITE_DELAY_SEC = 0.25
+# Delay between sequential public API calls (e.g. title lookups). Shikimori's
+# documented global limit is 90 rpm (1.5 rps) — 0.8 s gives ~75 rpm, with a
+# small margin under the cap.
+_POLITE_DELAY_SEC = 0.8
 
 
 def _auth(access_token: str) -> dict[str, str]:
@@ -68,9 +70,14 @@ async def get_anime_title(session: aiohttp.ClientSession, anime_id: int) -> str 
         async with session.get(f"{API_BASE}/animes/{anime_id}") as resp:
             resp.raise_for_status()
             data = await resp.json()
-    except aiohttp.ClientError:
+    except aiohttp.ClientError as e:
+        print(f"    ! fetch error for anime #{anime_id}: {e}", file=sys.stderr)
         return None
-    return data.get("russian") or data.get("name") or None
+    title = data.get("russian") or data.get("name")
+    if not title:
+        print(f"    ! no title in response for anime #{anime_id}", file=sys.stderr)
+        return None
+    return title
 
 
 async def create_list_entry(

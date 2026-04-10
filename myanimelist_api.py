@@ -33,8 +33,10 @@ async def get_anime_list(
 
     Follows paging.next until there are no more pages.
     """
+    # nsfw=true is required to include R+/Rx anime — MAL filters them out by
+    # default on endpoints that return user content (common `nsfw` parameter).
     url: str | None = (
-        f"{API_BASE}/users/@me/animelist?fields=list_status&limit=1000"
+        f"{API_BASE}/users/@me/animelist?fields=list_status&limit=1000&nsfw=true"
     )
     entries: list[dict] = []
     while url:
