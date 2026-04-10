@@ -1,0 +1,321 @@
+"""Sync MyAnimeList ↔ Shikimori anime lists.
+
+First iteration: find anime that are present on one service but missing on
+the other, and (with per-item manual confirmation) create the missing
+entries on the target service. Updates and deletions are out of scope for
+this pass.
+
+Run:
+    python3 sync.py
+"""
+
+from __future__ import annotations
+
+import asyncio
+import sys
+from dataclasses import dataclass
+
+import aiohttp
+
+import myanimelist_api
+import myanimelist_auth
+import shikimori_api
+import shikimori_auth
+
+
+USER_AGENT = "sync_myanimelist_and_shikimori"
+
+# Seconds to wait between successful write requests, to stay polite.
+_WRITE_DELAY_SEC = 1.0
+
+
+# ---------------------------------------------------------------------------
+# Canonical model
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ListEntry:
+    anime_id: int
+    title: str
+    status: str  # canonical: planned | watching | rewatching | completed | on_hold | dropped
+    score: int
+    episodes: int
+
+
+# MAL <-> canonical -----------------------------------------------------------
+
+_MAL_TO_CANONICAL = {
+    "plan_to_watch": "planned",
+    "watching": "watching",
+    "completed": "completed",
+    "on_hold": "on_hold",
+    "dropped": "dropped",
+}
+
+# canonical -> (mal_status, is_rewatching)
+_CANONICAL_TO_MAL = {
+    "planned": ("plan_to_watch", False),
+    "watching": ("watching", False),
+    "rewatching": ("watching", True),
+    "completed": ("completed", False),
+    "on_hold": ("on_hold", False),
+    "dropped": ("dropped", False),
+}
+
+
+def _mal_to_canonical(list_status: dict) -> str:
+    mal_status = list_status["status"]
+    if list_status.get("is_rewatching") and mal_status == "watching":
+        return "rewatching"
+    try:
+        return _MAL_TO_CANONICAL[mal_status]
+    except KeyError:
+        raise ValueError(f"Unknown MAL status: {mal_status!r}") from None
+
+
+# Shikimori <-> canonical -----------------------------------------------------
+
+_SHIKI_TO_CANONICAL = {
+    "planned": "planned",
+    "watching": "watching",
+    "rewatching": "rewatching",
+    "completed": "completed",
+    "on_hold": "on_hold",
+    "dropped": "dropped",
+}
+
+_CANONICAL_TO_SHIKI = {v: k for k, v in _SHIKI_TO_CANONICAL.items()}
+
+
+def _shiki_to_canonical(rate: dict) -> str:
+    try:
+        return _SHIKI_TO_CANONICAL[rate["status"]]
+    except KeyError:
+        raise ValueError(f"Unknown Shikimori status: {rate['status']!r}") from None
+
+
+# ---------------------------------------------------------------------------
+# Raw -> ListEntry converters
+# ---------------------------------------------------------------------------
+
+
+def _mal_entry_to_listentry(raw: dict) -> ListEntry:
+    node = raw["node"]
+    ls = raw["list_status"]
+    # MAL's read/write field names for episodes are asymmetric; be defensive.
+    episodes = ls.get("num_episodes_watched", ls.get("num_watched_episodes", 0))
+    return ListEntry(
+        anime_id=node["id"],
+        title=node["title"],
+        status=_mal_to_canonical(ls),
+        score=ls.get("score", 0),
+        episodes=episodes,
+    )
+
+
+def _shiki_entry_to_listentry(raw: dict, title: str) -> ListEntry:
+    return ListEntry(
+        anime_id=raw["target_id"],
+        title=title,
+        status=_shiki_to_canonical(raw),
+        score=raw.get("score", 0),
+        episodes=raw.get("episodes", 0),
+    )
+
+
+# ---------------------------------------------------------------------------
+# User interaction
+# ---------------------------------------------------------------------------
+
+
+async def _prompt(message: str) -> str:
+    return (await asyncio.to_thread(input, message)).strip().lower()
+
+
+async def _confirm_sync(direction: str, entry: ListEntry) -> str:
+    """Prompt the user about one planned create. Returns 'y', 'n' or 'q'."""
+    print(
+        f"[{direction}] #{entry.anime_id} {entry.title!r}  "
+        f"status={entry.status} score={entry.score} episodes={entry.episodes}"
+    )
+    while True:
+        answer = await _prompt("  Sync? [y/N/q] ")
+        if answer in ("", "n"):
+            return "n"
+        if answer == "y":
+            return "y"
+        if answer == "q":
+            return "q"
+        print("  Please answer y, n, or q.")
+
+
+# ---------------------------------------------------------------------------
+# Sync loops
+# ---------------------------------------------------------------------------
+
+
+async def _push_to_shikimori(
+    shiki_session: aiohttp.ClientSession,
+    shiki_token: str,
+    shiki_user_id: int,
+    entries: list[ListEntry],
+    tally: dict,
+) -> bool:
+    """Prompt and create each entry on Shikimori. Returns False if user quit."""
+    for entry in entries:
+        choice = await _confirm_sync("MAL → Shiki", entry)
+        if choice == "q":
+            return False
+        if choice == "n":
+            tally["skipped"] += 1
+            print("  skipped")
+            continue
+        try:
+            await shikimori_api.create_list_entry(
+                shiki_session,
+                shiki_token,
+                shiki_user_id,
+                entry.anime_id,
+                status=_CANONICAL_TO_SHIKI[entry.status],
+                score=entry.score,
+                episodes=entry.episodes,
+            )
+            tally["created"] += 1
+            print("  ✓ created on Shikimori")
+            await asyncio.sleep(_WRITE_DELAY_SEC)
+        except aiohttp.ClientResponseError as e:
+            tally["failed"] += 1
+            print(f"  ✗ failed: {e.status} {e.message}")
+    return True
+
+
+async def _push_to_mal(
+    mal_session: aiohttp.ClientSession,
+    mal_token: str,
+    entries: list[ListEntry],
+    tally: dict,
+) -> bool:
+    """Prompt and create each entry on MAL. Returns False if user quit."""
+    for entry in entries:
+        choice = await _confirm_sync("Shiki → MAL", entry)
+        if choice == "q":
+            return False
+        if choice == "n":
+            tally["skipped"] += 1
+            print("  skipped")
+            continue
+        mal_status, is_rewatching = _CANONICAL_TO_MAL[entry.status]
+        try:
+            await myanimelist_api.create_or_update_list_entry(
+                mal_session,
+                mal_token,
+                entry.anime_id,
+                status=mal_status,
+                score=entry.score,
+                num_watched_episodes=entry.episodes,
+                is_rewatching=is_rewatching,
+            )
+            tally["created"] += 1
+            print("  ✓ created on MAL")
+            await asyncio.sleep(_WRITE_DELAY_SEC)
+        except aiohttp.ClientResponseError as e:
+            tally["failed"] += 1
+            print(f"  ✗ failed: {e.status} {e.message}")
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator
+# ---------------------------------------------------------------------------
+
+
+async def main() -> int:
+    async with (
+        aiohttp.ClientSession(headers={"User-Agent": USER_AGENT}) as mal_session,
+        aiohttp.ClientSession(headers={"User-Agent": USER_AGENT}) as shiki_session,
+    ):
+        print("Authorizing on MyAnimeList...")
+        mal_token = await myanimelist_auth.get_access_token(mal_session)
+        print("Authorizing on Shikimori...")
+        shiki_token = await shikimori_auth.get_access_token(shiki_session)
+
+        mal_id, mal_name = await myanimelist_api.get_user_id(mal_session, mal_token)
+        shiki_id, shiki_nick = await shikimori_api.get_user_id(
+            shiki_session, shiki_token
+        )
+        print(f"MAL user:       #{mal_id} {mal_name}")
+        print(f"Shikimori user: #{shiki_id} {shiki_nick}")
+
+        print("Downloading lists...")
+        mal_raw = await myanimelist_api.get_anime_list(mal_session, mal_token)
+        shiki_raw = await shikimori_api.get_anime_list(
+            shiki_session, shiki_token, shiki_id
+        )
+
+        mal_entries: dict[int, ListEntry] = {}
+        for raw in mal_raw:
+            e = _mal_entry_to_listentry(raw)
+            mal_entries[e.anime_id] = e
+
+        # Shikimori rates don't include titles — store raw, resolve titles lazily.
+        shiki_raw_by_id: dict[int, dict] = {r["target_id"]: r for r in shiki_raw}
+
+        print(
+            f"MAL: {len(mal_entries)} entries, "
+            f"Shikimori: {len(shiki_raw_by_id)} entries"
+        )
+
+        only_in_mal_ids = sorted(mal_entries.keys() - shiki_raw_by_id.keys())
+        only_in_shiki_ids = sorted(shiki_raw_by_id.keys() - mal_entries.keys())
+        print(
+            f"{len(only_in_mal_ids)} to push MAL→Shikimori, "
+            f"{len(only_in_shiki_ids)} to push Shikimori→MAL"
+        )
+
+        # Build the two work lists.
+        to_push_shiki: list[ListEntry] = [mal_entries[i] for i in only_in_mal_ids]
+
+        to_push_mal: list[ListEntry] = []
+        if only_in_shiki_ids:
+            print(f"Fetching titles for {len(only_in_shiki_ids)} Shikimori entries...")
+            for anime_id in only_in_shiki_ids:
+                title = await shikimori_api.get_anime_title(shiki_session, anime_id)
+                to_push_mal.append(
+                    _shiki_entry_to_listentry(shiki_raw_by_id[anime_id], title)
+                )
+
+        tally = {"created": 0, "skipped": 0, "failed": 0}
+
+        if to_push_shiki:
+            print("\n--- MAL → Shikimori ---")
+            if not await _push_to_shikimori(
+                shiki_session, shiki_token, shiki_id, to_push_shiki, tally
+            ):
+                print("Stopped by user.")
+                _print_tally(tally)
+                return 0
+
+        if to_push_mal:
+            print("\n--- Shikimori → MAL ---")
+            if not await _push_to_mal(mal_session, mal_token, to_push_mal, tally):
+                print("Stopped by user.")
+                _print_tally(tally)
+                return 0
+
+        if not to_push_shiki and not to_push_mal:
+            print("Nothing to sync.")
+        _print_tally(tally)
+        return 0
+
+
+def _print_tally(tally: dict) -> None:
+    print(
+        f"Done. Created: {tally['created']}, "
+        f"Skipped: {tally['skipped']}, "
+        f"Failed: {tally['failed']}"
+    )
+
+
+if __name__ == "__main__":
+    sys.exit(asyncio.run(main()))
