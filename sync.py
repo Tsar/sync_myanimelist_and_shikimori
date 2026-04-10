@@ -216,6 +216,9 @@ async def _push_to_shikimori(
         except aiohttp.ClientResponseError as e:
             tally["failed"] += 1
             print(f"  ✗ failed: {e.status} {e.message}")
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            tally["failed"] += 1
+            print(f"  ✗ failed: {type(e).__name__}: {e}")
     return True
 
 
@@ -251,6 +254,9 @@ async def _push_to_mal(
         except aiohttp.ClientResponseError as e:
             tally["failed"] += 1
             print(f"  ✗ failed: {e.status} {e.message}")
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            tally["failed"] += 1
+            print(f"  ✗ failed: {type(e).__name__}: {e}")
     return True
 
 
