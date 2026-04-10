@@ -53,12 +53,15 @@ async def get_anime_list(
         return await resp.json()
 
 
-async def get_anime_title(session: aiohttp.ClientSession, anime_id: int) -> str:
-    """Best-effort title lookup for a Shikimori (== MAL) anime id.
+async def get_anime_title(session: aiohttp.ClientSession, anime_id: int) -> str | None:
+    """Title lookup for a Shikimori (== MAL) anime id.
 
-    Returns ``russian`` if set, else ``name``, else a ``#<id>`` placeholder
-    on any error. No auth required for this public endpoint, but the
-    session's User-Agent header is still applied.
+    Returns ``russian`` if set, else ``name``, else ``None`` on any error or
+    empty payload. The caller is responsible for any fallback or caching —
+    returning ``None`` on error lets the caller avoid caching failures.
+
+    No auth required for this public endpoint, but the session's User-Agent
+    header is still applied. Includes a small delay to stay polite.
     """
     await asyncio.sleep(_POLITE_DELAY_SEC)
     try:
@@ -66,8 +69,8 @@ async def get_anime_title(session: aiohttp.ClientSession, anime_id: int) -> str:
             resp.raise_for_status()
             data = await resp.json()
     except aiohttp.ClientError:
-        return f"(anime #{anime_id})"
-    return data.get("russian") or data.get("name") or f"(anime #{anime_id})"
+        return None
+    return data.get("russian") or data.get("name") or None
 
 
 async def create_list_entry(

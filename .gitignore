@@ -2,5 +2,6 @@ shikimori_tokens.json
 shikimori_app_oauth2_creds.json
 myanimelist_tokens.json
 myanimelist_app_oauth2_creds.json
+shikimori_titles_cache.json
 __pycache__/
 *.pyc

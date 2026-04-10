@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Sync MyAnimeList ↔ Shikimori anime lists.
 
 First iteration: find anime that are present on one service but missing on
@@ -12,8 +13,10 @@ Run:
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 
 import aiohttp
 
@@ -27,6 +30,24 @@ USER_AGENT = "sync_myanimelist_and_shikimori"
 
 # Seconds to wait between successful write requests, to stay polite.
 _WRITE_DELAY_SEC = 1.0
+
+PROJECT_DIR = Path(__file__).resolve().parent
+# Disk cache for Shikimori anime titles so re-runs don't re-fetch everything.
+TITLE_CACHE_PATH = PROJECT_DIR / "shikimori_titles_cache.json"
+
+
+def _load_title_cache() -> dict[int, str]:
+    if not TITLE_CACHE_PATH.exists():
+        return {}
+    try:
+        raw = json.loads(TITLE_CACHE_PATH.read_text())
+    except json.JSONDecodeError:
+        return {}
+    return {int(k): v for k, v in raw.items()}
+
+
+def _save_title_cache(cache: dict[int, str]) -> None:
+    TITLE_CACHE_PATH.write_text(json.dumps(cache, ensure_ascii=False, indent=2))
 
 
 # ---------------------------------------------------------------------------
@@ -278,12 +299,22 @@ async def main() -> int:
 
         to_push_mal: list[ListEntry] = []
         if only_in_shiki_ids:
-            print(f"Fetching titles for {len(only_in_shiki_ids)} Shikimori entries...")
-            for anime_id in only_in_shiki_ids:
-                title = await shikimori_api.get_anime_title(shiki_session, anime_id)
-                to_push_mal.append(
-                    _shiki_entry_to_listentry(shiki_raw_by_id[anime_id], title)
-                )
+            title_cache = _load_title_cache()
+            cached_hits = sum(1 for aid in only_in_shiki_ids if aid in title_cache)
+            to_fetch = len(only_in_shiki_ids) - cached_hits
+            print(f"Resolving titles for {len(only_in_shiki_ids)} Shikimori entries ({cached_hits} cached, {to_fetch} to fetch)...")
+            for idx, anime_id in enumerate(only_in_shiki_ids, start=1):
+                title = title_cache.get(anime_id)
+                if title is None:
+                    print(f"  [{idx}/{len(only_in_shiki_ids)}] fetching title for anime #{anime_id}...")
+                    fetched = await shikimori_api.get_anime_title(shiki_session, anime_id)
+                    if fetched is not None:
+                        title_cache[anime_id] = fetched
+                        _save_title_cache(title_cache)
+                        title = fetched
+                    else:
+                        title = f"(anime #{anime_id})"
+                to_push_mal.append(_shiki_entry_to_listentry(shiki_raw_by_id[anime_id], title))
 
         tally = {"created": 0, "skipped": 0, "failed": 0}
 
