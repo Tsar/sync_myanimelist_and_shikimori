@@ -211,11 +211,14 @@ async def get_access_token(session: aiohttp.ClientSession) -> str:
 
     if tokens and tokens.get("refresh_token"):
         try:
-            tokens = _stamp(
+            refreshed = _stamp(
                 await _refresh(session, client_id, client_secret, tokens["refresh_token"])
             )
-            _save_tokens(tokens)
-            return tokens["access_token"]
+            # If MAL ever stops returning a new refresh_token on refresh, keep
+            # the old one — otherwise the next run has no way back.
+            refreshed.setdefault("refresh_token", tokens["refresh_token"])
+            _save_tokens(refreshed)
+            return refreshed["access_token"]
         except aiohttp.ClientResponseError as e:
             print(
                 f"Refresh failed ({e}); falling back to browser flow.",
