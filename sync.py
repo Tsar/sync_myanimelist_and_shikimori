@@ -306,17 +306,17 @@ async def main() -> int:
         print("Authorizing on Shikimori...")
         shiki_token = await shikimori_auth.get_access_token(shiki_session)
 
-        mal_id, mal_name = await myanimelist_api.get_user_id(mal_session, mal_token)
-        shiki_id, shiki_nick = await shikimori_api.get_user_id(
-            shiki_session, shiki_token
+        (mal_id, mal_name), (shiki_id, shiki_nick) = await asyncio.gather(
+            myanimelist_api.get_user_id(mal_session, mal_token),
+            shikimori_api.get_user_id(shiki_session, shiki_token),
         )
         print(f"MAL user:       #{mal_id} {mal_name}")
         print(f"Shikimori user: #{shiki_id} {shiki_nick}")
 
         print("Downloading lists...")
-        mal_raw = await myanimelist_api.get_anime_list(mal_session, mal_token)
-        shiki_raw = await shikimori_api.get_anime_list(
-            shiki_session, shiki_token, shiki_id
+        mal_raw, shiki_raw = await asyncio.gather(
+            myanimelist_api.get_anime_list(mal_session, mal_token),
+            shikimori_api.get_anime_list(shiki_session, shiki_token, shiki_id),
         )
 
         mal_entries: dict[int, ListEntry] = {}
@@ -377,7 +377,7 @@ async def main() -> int:
             ):
                 print("Stopped by user.")
                 _print_tally(tally)
-                return 0
+                return 1 if tally["failed"] else 0
 
         if to_push_mal:
             print("\n--- Shikimori → MAL ---")
@@ -390,12 +390,12 @@ async def main() -> int:
             ):
                 print("Stopped by user.")
                 _print_tally(tally)
-                return 0
+                return 1 if tally["failed"] else 0
 
         if not to_push_shiki and not to_push_mal:
             print("Nothing to sync.")
         _print_tally(tally)
-        return 0
+        return 1 if tally["failed"] else 0
 
 
 def _print_tally(tally: dict) -> None:
