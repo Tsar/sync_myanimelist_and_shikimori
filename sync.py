@@ -1,15 +1,23 @@
 #!/usr/bin/env python3
 """Sync MyAnimeList ↔ Shikimori anime lists.
 
-First iteration: find anime that are present on one service but missing on
-the other and create the missing entries on the target service. By default
-each create is confirmed interactively; pass ``--autosync`` to skip the
-prompts and create everything. Updates and deletions are out of scope for
-this pass.
+Three phases:
+  1. Create on Shikimori anything that exists only on MAL.
+  2. Create on MAL anything that exists only on Shikimori.
+  3. For entries present on both sides, diff the tracked fields and push
+     the "newer" side over the older one. Ambiguous diffs (each side
+     ahead on a different field, disagreeing non-zero scores, or status
+     pairs that aren't strictly ordered like rewatching↔completed) are
+     surfaced as conflicts for the user to resolve.
+
+By default every write is confirmed interactively; pass ``--autosync`` to
+skip the prompts. In ``--autosync`` mode conflicts are skipped — the tool
+never silently overwrites ambiguous user data. Deletions are still out
+of scope.
 
 Run:
     python3 sync.py            # interactive per-entry confirmation
-    python3 sync.py --autosync # create everything without prompting
+    python3 sync.py --autosync # write everything non-conflicting without prompting
 """
 
 from __future__ import annotations
@@ -127,6 +135,90 @@ def _shiki_to_canonical(rate: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Update-diff heuristics
+# ---------------------------------------------------------------------------
+
+# Strict "earlier < later" pairs on the canonical status. The relation is a
+# *partial* order — pairs not listed (in either direction) are incomparable
+# and surface as conflicts that the user has to resolve. Notably:
+#   - on_hold ↔ dropped: both are reassessment states, neither strictly later.
+#   - rewatching ↔ {on_hold, dropped, completed}: rewatching is the user's
+#     deliberate re-pass; the tool must not auto-overwrite a completed entry
+#     just because the other side flipped to rewatching.
+_STATUS_LT: frozenset[tuple[str, str]] = frozenset({
+    ("planned", "watching"),
+    ("planned", "on_hold"),
+    ("planned", "dropped"),
+    ("planned", "completed"),
+    ("planned", "rewatching"),
+    ("watching", "on_hold"),
+    ("watching", "dropped"),
+    ("watching", "completed"),
+    ("watching", "rewatching"),
+    ("on_hold", "completed"),
+    ("dropped", "completed"),
+})
+
+
+def _status_cmp(a: str, b: str) -> int | None:
+    """Partial-order compare. -1 if a<b, 0 if equal, 1 if a>b, None if incomparable."""
+    if a == b:
+        return 0
+    if (a, b) in _STATUS_LT:
+        return -1
+    if (b, a) in _STATUS_LT:
+        return 1
+    return None
+
+
+def _pick_winner(mal: "ListEntry", shiki: "ListEntry") -> str:
+    """Decide which side is "newer" for an entry present on both services.
+
+    Returns one of:
+        "agree"    — the two sides already match on every tracked field.
+        "mal"      — MAL has the newer state; push MAL → Shikimori.
+        "shiki"    — Shikimori has the newer state; push Shiki → MAL.
+        "conflict" — ambiguous; the user (or autosync skip) must decide.
+    """
+    status_cmp = _status_cmp(mal.status, shiki.status)
+    if status_cmp is None:
+        return "conflict"
+
+    # Score: zero == unset, so non-zero wins over zero. Two disagreeing
+    # non-zero scores are a real conflict — never silently overwrite a
+    # rating the user set by hand.
+    if mal.score == shiki.score:
+        score_winner: str | None = None
+    elif mal.score == 0:
+        score_winner = "shiki"
+    elif shiki.score == 0:
+        score_winner = "mal"
+    else:
+        return "conflict"
+
+    if mal.episodes == shiki.episodes:
+        episodes_winner: str | None = None
+    elif mal.episodes > shiki.episodes:
+        episodes_winner = "mal"
+    else:
+        episodes_winner = "shiki"
+
+    if status_cmp == 0:
+        status_winner: str | None = None
+    elif status_cmp > 0:
+        status_winner = "mal"
+    else:
+        status_winner = "shiki"
+
+    winners = {w for w in (status_winner, score_winner, episodes_winner) if w}
+    if not winners:
+        return "agree"
+    if len(winners) == 1:
+        return winners.pop()
+    return "conflict"
+
+
+# ---------------------------------------------------------------------------
 # Raw -> ListEntry converters
 # ---------------------------------------------------------------------------
 
@@ -185,6 +277,58 @@ async def _confirm_sync(direction: str, entry: ListEntry) -> str:
             return "n"
         if answer == "q":
             return "q"
+        print("  Please answer y, n, or q.")
+
+
+def _print_update_diff(mal: ListEntry, shiki: ListEntry, verdict: str) -> None:
+    """Show a side-by-side view of an entry that exists on both sides."""
+    title = mal.title or shiki.title
+    print(f"[update] #{mal.anime_id} {title!r}")
+    print(f"  {'':<8} {'MAL':<14} {'Shiki':<14}")
+    for field in ("status", "score", "episodes"):
+        m = getattr(mal, field)
+        s = getattr(shiki, field)
+        marker = "  " if m == s else " *"
+        print(f"  {field + ':':<8} {str(m):<14} {str(s):<14}{marker}")
+    if verdict == "mal":
+        print("  → winner: MAL  (push MAL → Shikimori)")
+    elif verdict == "shiki":
+        print("  → winner: Shikimori  (push Shikimori → MAL)")
+    elif verdict == "conflict":
+        print("  → conflict: each side is ahead on a different field")
+
+
+async def _confirm_update(
+    mal: ListEntry, shiki: ListEntry, verdict: str
+) -> str:
+    """Prompt the user about one planned update.
+
+    Returns one of 'mal', 'shiki', 'skip', 'quit'. For non-conflict
+    verdicts the prompt is [Y/n/q] (Enter accepts the auto-picked
+    winner). For conflict verdicts it's [m/s/n/q] (no default — the
+    user must pick a side explicitly).
+    """
+    _print_update_diff(mal, shiki, verdict)
+    if verdict == "conflict":
+        while True:
+            answer = await _prompt("  Sync? [m=MAL→Shiki, s=Shiki→MAL, n=skip, q=quit] ")
+            if answer == "m":
+                return "mal"
+            if answer == "s":
+                return "shiki"
+            if answer == "n":
+                return "skip"
+            if answer == "q":
+                return "quit"
+            print("  Please answer m, s, n, or q.")
+    while True:
+        answer = await _prompt("  Sync? [Y/n/q] ")
+        if answer in ("", "y"):
+            return verdict  # "mal" or "shiki"
+        if answer == "n":
+            return "skip"
+        if answer == "q":
+            return "quit"
         print("  Please answer y, n, or q.")
 
 
@@ -281,6 +425,80 @@ async def _push_to_mal(
     return True
 
 
+async def _push_updates(
+    mal_session: aiohttp.ClientSession,
+    mal_token: str,
+    shiki_session: aiohttp.ClientSession,
+    shiki_token: str,
+    items: list[tuple[ListEntry, ListEntry, str, int]],
+    tally: dict,
+    *,
+    autosync: bool,
+) -> bool:
+    """Push divergent updates between the two services. Returns False if user quit.
+
+    Each item is ``(mal_entry, shiki_entry, verdict, shiki_user_rate_id)``
+    where ``verdict`` is "mal" / "shiki" / "conflict" — never "agree", as
+    those are filtered out by the caller.
+    """
+    for mal_entry, shiki_entry, verdict, user_rate_id in items:
+        if autosync:
+            _print_update_diff(mal_entry, shiki_entry, verdict)
+            if verdict == "conflict":
+                tally["conflicts"] += 1
+                print("  ! conflict, skipped")
+                continue
+            action = verdict
+        else:
+            action = await _confirm_update(mal_entry, shiki_entry, verdict)
+            if action == "quit":
+                return False
+            if action == "skip":
+                if verdict == "conflict":
+                    tally["conflicts"] += 1
+                    print("  conflict skipped")
+                else:
+                    tally["skipped"] += 1
+                    print("  skipped")
+                continue
+
+        try:
+            if action == "mal":
+                # MAL is the winner: PATCH Shikimori to match MAL.
+                await shikimori_api.update_list_entry(
+                    shiki_session,
+                    shiki_token,
+                    user_rate_id,
+                    status=_CANONICAL_TO_SHIKI[mal_entry.status],
+                    score=mal_entry.score,
+                    episodes=mal_entry.episodes,
+                )
+                tally["updated"] += 1
+                print("  ✓ updated on Shikimori")
+            else:  # action == "shiki"
+                mal_status, is_rewatching = _CANONICAL_TO_MAL[shiki_entry.status]
+                await myanimelist_api.create_or_update_list_entry(
+                    mal_session,
+                    mal_token,
+                    shiki_entry.anime_id,
+                    status=mal_status,
+                    score=shiki_entry.score,
+                    num_watched_episodes=shiki_entry.episodes,
+                    is_rewatching=is_rewatching,
+                )
+                tally["updated"] += 1
+                print("  ✓ updated on MAL")
+            if autosync:
+                await asyncio.sleep(_WRITE_DELAY_SEC)
+        except aiohttp.ClientResponseError as e:
+            tally["failed"] += 1
+            print(f"  ✗ failed: {e.status} {e.message}")
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            tally["failed"] += 1
+            print(f"  ✗ failed: {type(e).__name__}: {e}")
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
@@ -334,9 +552,11 @@ async def main() -> int:
 
         only_in_mal_ids = sorted(mal_entries.keys() - shiki_raw_by_id.keys())
         only_in_shiki_ids = sorted(shiki_raw_by_id.keys() - mal_entries.keys())
+        in_both_ids = sorted(mal_entries.keys() & shiki_raw_by_id.keys())
         print(
             f"{len(only_in_mal_ids)} to push MAL→Shikimori, "
-            f"{len(only_in_shiki_ids)} to push Shikimori→MAL"
+            f"{len(only_in_shiki_ids)} to push Shikimori→MAL, "
+            f"{len(in_both_ids)} present on both"
         )
 
         # Build the two work lists.
@@ -363,7 +583,29 @@ async def main() -> int:
                         title = f"(anime #{anime_id})"
                 to_push_mal.append(_shiki_entry_to_listentry(shiki_raw_by_id[anime_id], title))
 
-        tally = {"created": 0, "skipped": 0, "failed": 0}
+        # Build the update work list. No extra title fetches needed —
+        # entries present on both sides already have a MAL title we can
+        # display, so we reuse it for the Shikimori-side ListEntry too.
+        to_update: list[tuple[ListEntry, ListEntry, str, int]] = []
+        for anime_id in in_both_ids:
+            mal_entry = mal_entries[anime_id]
+            shiki_raw = shiki_raw_by_id[anime_id]
+            shiki_entry = _shiki_entry_to_listentry(shiki_raw, mal_entry.title)
+            verdict = _pick_winner(mal_entry, shiki_entry)
+            if verdict == "agree":
+                continue
+            to_update.append((mal_entry, shiki_entry, verdict, shiki_raw["id"]))
+
+        if to_update:
+            print(f"{len(to_update)} entries diverge and need update review")
+
+        tally = {
+            "created": 0,
+            "updated": 0,
+            "skipped": 0,
+            "conflicts": 0,
+            "failed": 0,
+        }
 
         if to_push_shiki:
             print("\n--- MAL → Shikimori ---")
@@ -392,7 +634,22 @@ async def main() -> int:
                 _print_tally(tally)
                 return 1 if tally["failed"] else 0
 
-        if not to_push_shiki and not to_push_mal:
+        if to_update:
+            print("\n--- Updates ---")
+            if not await _push_updates(
+                mal_session,
+                mal_token,
+                shiki_session,
+                shiki_token,
+                to_update,
+                tally,
+                autosync=args.autosync,
+            ):
+                print("Stopped by user.")
+                _print_tally(tally)
+                return 1 if tally["failed"] else 0
+
+        if not to_push_shiki and not to_push_mal and not to_update:
             print("Nothing to sync.")
         _print_tally(tally)
         return 1 if tally["failed"] else 0
@@ -401,7 +658,9 @@ async def main() -> int:
 def _print_tally(tally: dict) -> None:
     print(
         f"Done. Created: {tally['created']}, "
+        f"Updated: {tally['updated']}, "
         f"Skipped: {tally['skipped']}, "
+        f"Conflicts: {tally['conflicts']}, "
         f"Failed: {tally['failed']}"
     )
 
