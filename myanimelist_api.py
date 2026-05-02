@@ -36,7 +36,8 @@ async def get_anime_list(
     # nsfw=true is required to include R+/Rx anime — MAL filters them out by
     # default on endpoints that return user content (common `nsfw` parameter).
     url: str | None = (
-        f"{API_BASE}/users/@me/animelist?fields=list_status&limit=1000&nsfw=true"
+        f"{API_BASE}/users/@me/animelist"
+        f"?fields=list_status{{num_times_rewatched}}&limit=1000&nsfw=true"
     )
     entries: list[dict] = []
     while url:
@@ -57,6 +58,7 @@ async def create_or_update_list_entry(
     score: int,
     num_watched_episodes: int,
     is_rewatching: bool,
+    num_times_rewatched: int,
 ) -> dict:
     """Create or update a MAL list entry for ``anime_id``.
 
@@ -70,6 +72,7 @@ async def create_or_update_list_entry(
         "score": str(score),
         "num_watched_episodes": str(num_watched_episodes),
         "is_rewatching": "true" if is_rewatching else "false",
+        "num_times_rewatched": str(num_times_rewatched),
     }
     async with session.put(
         f"{API_BASE}/anime/{anime_id}/my_list_status",

@@ -89,6 +89,7 @@ async def create_list_entry(
     status: str,
     score: int,
     episodes: int,
+    rewatches: int,
 ) -> dict:
     """Create a Shikimori user_rate for ``anime_id``."""
     payload = {
@@ -99,6 +100,7 @@ async def create_list_entry(
             "status": status,
             "score": score,
             "episodes": episodes,
+            "rewatches": rewatches,
         }
     }
     async with session.post(
@@ -121,19 +123,21 @@ async def update_list_entry(
     status: str,
     score: int,
     episodes: int,
+    rewatches: int,
 ) -> dict:
     """Update an existing Shikimori user_rate by its ``user_rate_id``.
 
     ``user_rate_id`` is the rate row's own id (returned in the
     ``user_rates`` list response), distinct from the anime's ``target_id``.
     PATCH is partial — fields not sent are left untouched — but we always
-    send the three canonical fields the sync model knows about.
+    send the canonical fields the sync model knows about.
     """
     payload = {
         "user_rate": {
             "status": status,
             "score": score,
             "episodes": episodes,
+            "rewatches": rewatches,
         }
     }
     async with session.patch(

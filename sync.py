@@ -80,6 +80,7 @@ class ListEntry:
     status: str  # canonical: planned | watching | rewatching | completed | on_hold | dropped
     score: int
     episodes: int
+    rewatches: int
 
 
 # MAL <-> canonical -----------------------------------------------------------
@@ -203,6 +204,13 @@ def _pick_winner(mal: "ListEntry", shiki: "ListEntry") -> str:
     else:
         episodes_winner = "shiki"
 
+    if mal.rewatches == shiki.rewatches:
+        rewatches_winner: str | None = None
+    elif mal.rewatches > shiki.rewatches:
+        rewatches_winner = "mal"
+    else:
+        rewatches_winner = "shiki"
+
     if status_cmp == 0:
         status_winner: str | None = None
     elif status_cmp > 0:
@@ -210,7 +218,7 @@ def _pick_winner(mal: "ListEntry", shiki: "ListEntry") -> str:
     else:
         status_winner = "shiki"
 
-    winners = {w for w in (status_winner, score_winner, episodes_winner) if w}
+    winners = {w for w in (status_winner, score_winner, episodes_winner, rewatches_winner) if w}
     if not winners:
         return "agree"
     if len(winners) == 1:
@@ -234,6 +242,7 @@ def _mal_entry_to_listentry(raw: dict) -> ListEntry:
         status=_mal_to_canonical(ls),
         score=ls.get("score", 0),
         episodes=episodes,
+        rewatches=ls.get("num_times_rewatched", 0),
     )
 
 
@@ -244,6 +253,7 @@ def _shiki_entry_to_listentry(raw: dict, title: str) -> ListEntry:
         status=_shiki_to_canonical(raw),
         score=raw.get("score", 0),
         episodes=raw.get("episodes", 0),
+        rewatches=raw.get("rewatches", 0),
     )
 
 
@@ -258,9 +268,10 @@ async def _prompt(message: str) -> str:
 
 def _print_entry(direction: str, entry: ListEntry) -> None:
     print(f"[{direction}] #{entry.anime_id} {entry.title!r}")
-    print(f"  status:   {entry.status}")
-    print(f"  score:    {entry.score}")
-    print(f"  episodes: {entry.episodes}")
+    print(f"  status:    {entry.status}")
+    print(f"  score:     {entry.score}")
+    print(f"  episodes:  {entry.episodes}")
+    print(f"  rewatches: {entry.rewatches}")
 
 
 async def _confirm_sync(direction: str, entry: ListEntry) -> str:
@@ -285,7 +296,7 @@ def _print_update_diff(mal: ListEntry, shiki: ListEntry, verdict: str) -> None:
     title = mal.title or shiki.title
     print(f"[update] #{mal.anime_id} {title!r}")
     print(f"  {'':<8} {'MAL':<14} {'Shiki':<14}")
-    for field in ("status", "score", "episodes"):
+    for field in ("status", "score", "episodes", "rewatches"):
         m = getattr(mal, field)
         s = getattr(shiki, field)
         marker = "  " if m == s else " *"
@@ -367,6 +378,7 @@ async def _push_to_shikimori(
                 status=_CANONICAL_TO_SHIKI[entry.status],
                 score=entry.score,
                 episodes=entry.episodes,
+                rewatches=entry.rewatches,
             )
             tally["created"] += 1
             print("  ✓ created on Shikimori")
@@ -411,6 +423,7 @@ async def _push_to_mal(
                 score=entry.score,
                 num_watched_episodes=entry.episodes,
                 is_rewatching=is_rewatching,
+                num_times_rewatched=entry.rewatches,
             )
             tally["created"] += 1
             print("  ✓ created on MAL")
@@ -472,6 +485,7 @@ async def _push_updates(
                     status=_CANONICAL_TO_SHIKI[mal_entry.status],
                     score=mal_entry.score,
                     episodes=mal_entry.episodes,
+                    rewatches=mal_entry.rewatches,
                 )
                 tally["updated"] += 1
                 print("  ✓ updated on Shikimori")
@@ -485,6 +499,7 @@ async def _push_updates(
                     score=shiki_entry.score,
                     num_watched_episodes=shiki_entry.episodes,
                     is_rewatching=is_rewatching,
+                    num_times_rewatched=shiki_entry.rewatches,
                 )
                 tally["updated"] += 1
                 print("  ✓ updated on MAL")
