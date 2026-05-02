@@ -93,11 +93,14 @@ _MAL_TO_CANONICAL = {
     "dropped": "dropped",
 }
 
-# canonical -> (mal_status, is_rewatching)
+# canonical -> (mal_status, is_rewatching). MAL's `is_rewatching` checkbox
+# is orthogonal to the status dropdown — the conventional "I've finished
+# it, now rewatching" state on MAL is `(completed, is_rewatching=true)`,
+# which is what we write for canonical `rewatching`.
 _CANONICAL_TO_MAL = {
     "planned": ("plan_to_watch", False),
     "watching": ("watching", False),
-    "rewatching": ("watching", True),
+    "rewatching": ("completed", True),
     "completed": ("completed", False),
     "on_hold": ("on_hold", False),
     "dropped": ("dropped", False),
@@ -105,9 +108,14 @@ _CANONICAL_TO_MAL = {
 
 
 def _mal_to_canonical(list_status: dict) -> str:
-    mal_status = list_status["status"]
-    if list_status.get("is_rewatching") and mal_status == "watching":
+    # MAL's `is_rewatching` flag combines with any status (commonly
+    # `completed` — see the MAL edit-anime UI). Whenever it's set, the
+    # canonical state is `rewatching` regardless of the underlying MAL
+    # status, so the round-trip through Shikimori (which has an explicit
+    # `rewatching` status) doesn't lose information.
+    if list_status.get("is_rewatching"):
         return "rewatching"
+    mal_status = list_status["status"]
     try:
         return _MAL_TO_CANONICAL[mal_status]
     except KeyError:
