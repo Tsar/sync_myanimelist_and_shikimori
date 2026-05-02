@@ -189,10 +189,6 @@ def _pick_winner(mal: "ListEntry", shiki: "ListEntry") -> str:
         "shiki"    — Shikimori has the newer state; push Shiki → MAL.
         "conflict" — ambiguous; the user (or autosync skip) must decide.
     """
-    status_cmp = _status_cmp(mal.status, shiki.status)
-    if status_cmp is None:
-        return "conflict"
-
     # Score: zero == unset, so non-zero wins over zero. Two disagreeing
     # non-zero scores are a real conflict — never silently overwrite a
     # rating the user set by hand.
@@ -203,6 +199,30 @@ def _pick_winner(mal: "ListEntry", shiki: "ListEntry") -> str:
     elif shiki.score == 0:
         score_winner = "mal"
     else:
+        return "conflict"
+
+    status_cmp = _status_cmp(mal.status, shiki.status)
+
+    # Special case: rewatching ↔ completed sit on a single progression
+    # line if we fold in the rewatch count.
+    #   - completed, rewatches=N → finished N rewatches.
+    #   - rewatching, rewatches=N → mid-(N+1)th rewatch: past
+    #     completed/N but not yet at completed/N+1.
+    # Combined progress = 2 * rewatches + (1 if rewatching else 0) is
+    # monotonic and never ties between the two statuses (odd vs even).
+    # In this pair, episodes is also subsumed (completed reports full
+    # length, rewatching reports mid-pass), so we don't compare it
+    # separately or we'd get spurious conflicts on every legitimate
+    # rewatch transition.
+    if status_cmp is None and {mal.status, shiki.status} == {"rewatching", "completed"}:
+        mal_p = 2 * mal.rewatches + (1 if mal.status == "rewatching" else 0)
+        shiki_p = 2 * shiki.rewatches + (1 if shiki.status == "rewatching" else 0)
+        progress_winner = "mal" if mal_p > shiki_p else "shiki"
+        if score_winner is None or score_winner == progress_winner:
+            return progress_winner
+        return "conflict"
+
+    if status_cmp is None:
         return "conflict"
 
     if mal.episodes == shiki.episodes:
