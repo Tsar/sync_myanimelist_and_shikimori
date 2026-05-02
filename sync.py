@@ -521,7 +521,8 @@ async def _push_updates(
 
 async def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Sync MyAnimeList ↔ Shikimori anime lists."
+        description="Sync MyAnimeList ↔ Shikimori anime lists.",
+        allow_abbrev=False,
     )
     parser.add_argument(
         "--autosync",
